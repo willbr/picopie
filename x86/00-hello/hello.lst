@@ -1,0 +1,34 @@
+     1                                  section .data
+     2 00000000 48656C6C6F2C20576F-         hello db 'Hello, World!', 0
+     2 00000009 726C642100         
+     3                                  
+     4                                  section .bss
+     5 00000000 ????????????????            bytes_written resq 1
+     6                                  
+     7                                  section .text
+     8                                      global main
+     9                                      extern GetStdHandle
+    10                                      extern WriteFile
+    11                                      extern ExitProcess
+    12                                  
+    13                                  main:
+    14                                      ; Reserve shadow space
+    15 00000000 4883EC28                    sub rsp, 28h
+    16                                  
+    17                                      ; Get the handle to the standard output
+    18 00000004 B9F5FFFFFF                  mov ecx, -11                 ; STD_OUTPUT_HANDLE
+    19 00000009 E8(00000000)                call GetStdHandle
+    20                                  
+    21                                      ; Store the handle
+    22 0000000E 4889C3                      mov rbx, rax
+    23                                  
+    24                                      ; Write "Hello, World!" to the standard output
+    25 00000011 488D15(00000000)            lea rdx, [rel hello]         ; Pointer to the string
+    26 00000018 41B80D000000                mov r8, 13                   ; Length of the string
+    27 0000001E 4C8D0D(00000000)            lea r9, [rel bytes_written]  ; Address of number of bytes written
+    28 00000025 4889D9                      mov rcx, rbx                 ; Handle to the standard output
+    29 00000028 E8(00000000)                call WriteFile
+    30                                  
+    31                                      ; Exit the process
+    32 0000002D 31C9                        xor ecx, ecx                 ; Exit code 0
+    33 0000002F E8(00000000)                call ExitProcess
