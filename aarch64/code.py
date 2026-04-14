@@ -41,7 +41,7 @@ invalidate = libc.sys_icache_invalidate
 invalidate.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 invalidate(buf, len(byte_array))
 
-functype = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)
+functype = ctypes.CFUNCTYPE(ctypes.c_float, ctypes.c_int)
 
 increment_by_one = functype(buf)
 result = increment_by_one(42)

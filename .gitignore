@@ -166,3 +166,7 @@ cython_debug/
 *.exe
 *.obj
 
+# aarch64 files
+aarch64/test/hello
+*.o
+
