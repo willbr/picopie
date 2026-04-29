@@ -1,4 +1,4 @@
-"""AArch64 machine code emitter for picopie."""
+"""AArch64 machine code emitter for picopie. 64-bit (X-registers) throughout."""
 
 import struct
 
@@ -8,8 +8,9 @@ class Emitter:
 
     def __init__(self):
         self.code = bytearray()
-        self._patches = []  # (offset, kind, target_label)
-        self._labels = {}   # label -> offset
+        self._patches = []   # (offset, kind, target_label) — intra-function
+        self._labels = {}    # label -> offset within this function
+        self.calls = []      # (offset, target_function_name) — resolved by linker
 
     def _emit(self, word):
         self.code += struct.pack('<I', word)
@@ -29,72 +30,95 @@ class Emitter:
                 continue
 
             target_pos = self._labels[target]
-            disp = (target_pos - offset) >> 2  # in instructions
+            disp = (target_pos - offset) >> 2
 
             old = struct.unpack_from('<I', self.code, offset)[0]
 
             if kind == 'b':
-                # B imm26 — bits [25:0]
                 old = (old & 0xfc000000) | (disp & 0x03ffffff)
             elif kind == 'bcond':
-                # B.cond imm19 — bits [23:5]
                 old = (old & 0xff00001f) | ((disp & 0x7ffff) << 5)
 
             struct.pack_into('<I', self.code, offset, old)
         self._patches = remaining
 
-    # -- Arithmetic (32-bit) --
+    # -- Arithmetic, register operands (64-bit) --
 
     def add_reg(self, rd, rn, rm):
-        self._emit(0x0b000000 | (rm << 16) | (rn << 5) | rd)
+        self._emit(0x8b000000 | (rm << 16) | (rn << 5) | rd)
 
     def sub_reg(self, rd, rn, rm):
-        self._emit(0x4b000000 | (rm << 16) | (rn << 5) | rd)
+        self._emit(0xcb000000 | (rm << 16) | (rn << 5) | rd)
 
     def mul(self, rd, rn, rm):
-        self._emit(0x1b007c00 | (rm << 16) | (rn << 5) | rd)
+        # MADD rd, rn, rm, xzr
+        self._emit(0x9b007c00 | (rm << 16) | (rn << 5) | rd)
 
     def sdiv(self, rd, rn, rm):
-        self._emit(0x1ac00c00 | (rm << 16) | (rn << 5) | rd)
+        self._emit(0x9ac00c00 | (rm << 16) | (rn << 5) | rd)
 
     def msub(self, rd, rn, rm, ra):
-        """rd = ra - rn * rm  (used for modulo: a % b = a - (a/b)*b)"""
-        self._emit(0x1b008000 | (rm << 16) | (ra << 10) | (rn << 5) | rd)
+        """rd = ra - rn * rm"""
+        self._emit(0x9b008000 | (rm << 16) | (ra << 10) | (rn << 5) | rd)
 
     def neg(self, rd, rm):
-        # sub rd, wzr, rm
         self.sub_reg(rd, 31, rm)
 
     # -- Immediates --
 
-    def mov_imm(self, rd, imm):
-        if imm < 0:
-            # MOVN rd, #(~imm)
-            nimm = (~imm) & 0xffff
-            self._emit(0x12800000 | (nimm << 5) | rd)
-        else:
-            # MOVZ rd, #imm
-            self._emit(0x52800000 | ((imm & 0xffff) << 5) | rd)
-
     def add_imm(self, rd, rn, imm):
-        self._emit(0x11000000 | ((imm & 0xfff) << 10) | (rn << 5) | rd)
+        """ADD rd, rn, #imm (also "ADD SP, SP, #imm" when rd=rn=31)."""
+        assert 0 <= imm < 4096
+        self._emit(0x91000000 | ((imm & 0xfff) << 10) | (rn << 5) | rd)
 
     def sub_imm(self, rd, rn, imm):
-        self._emit(0x51000000 | ((imm & 0xfff) << 10) | (rn << 5) | rd)
+        """SUB rd, rn, #imm (also "SUB SP, SP, #imm" when rd=rn=31)."""
+        assert 0 <= imm < 4096
+        self._emit(0xd1000000 | ((imm & 0xfff) << 10) | (rn << 5) | rd)
+
+    def mov_imm(self, rd, imm):
+        """64-bit immediate via MOVZ/MOVN + MOVK chain."""
+        val = imm & ((1 << 64) - 1)
+
+        if val == 0:
+            self._emit(0xd2800000 | rd)
+            return
+
+        chunks = [(val >> (16 * i)) & 0xffff for i in range(4)]
+        n_zero = sum(1 for c in chunks if c == 0)
+        n_ones = sum(1 for c in chunks if c == 0xffff)
+
+        if n_ones > n_zero:
+            # MOVN with first chunk, then MOVK for any non-0xffff chunks above it.
+            inv = chunks[0] ^ 0xffff
+            self._emit(0x92800000 | (inv << 5) | rd)
+            for i in range(1, 4):
+                if chunks[i] != 0xffff:
+                    self._emit(0xf2800000 | (i << 21) | (chunks[i] << 5) | rd)
+        else:
+            first = next(i for i, c in enumerate(chunks) if c != 0)
+            self._emit(0xd2800000 | (first << 21) | (chunks[first] << 5) | rd)
+            for i in range(first + 1, 4):
+                if chunks[i] != 0:
+                    self._emit(0xf2800000 | (i << 21) | (chunks[i] << 5) | rd)
 
     # -- Comparison --
 
     def cmp_reg(self, rn, rm):
-        # subs wzr, rn, rm
-        self._emit(0x6b000000 | (rm << 16) | (rn << 5) | 31)
+        # SUBS xzr, rn, rm
+        self._emit(0xeb000000 | (rm << 16) | (rn << 5) | 31)
 
-    # Condition codes
+    def cmp_imm(self, rn, imm):
+        # SUBS xzr, rn, #imm
+        assert 0 <= imm < 4096
+        self._emit(0xf1000000 | ((imm & 0xfff) << 10) | (rn << 5) | 31)
+
     EQ = 0x0
     NE = 0x1
-    LT = 0xb  # signed less than
-    GE = 0xa  # signed greater or equal
-    LE = 0xd  # signed less or equal
-    GT = 0xc  # signed greater than
+    LT = 0xb  # signed
+    GE = 0xa
+    LE = 0xd
+    GT = 0xc
 
     COND_MAP = {
         '==': EQ, '!=': NE,
@@ -103,37 +127,59 @@ class Emitter:
     }
 
     def cset(self, rd, cond):
-        # CSET is CSINC rd, wzr, wzr, invert(cond)
+        # CSINC rd, xzr, xzr, invert(cond)
         inv = cond ^ 1
-        self._emit(0x1a9f0400 | (inv << 12) | (31 << 5) | rd)
+        self._emit(0x9a9f07e0 | (inv << 12) | rd)
+
+    # -- Move register --
+
+    def mov_reg(self, rd, rm):
+        # ORR rd, xzr, rm
+        self._emit(0xaa0003e0 | (rm << 16) | rd)
+
+    # -- Memory: SP-relative load/store --
+
+    def str_x_sp(self, rt, offset):
+        """STR Xrt, [SP, #offset]"""
+        assert offset % 8 == 0 and 0 <= offset < 32768
+        self._emit(0xf90003e0 | ((offset // 8) << 10) | rt)
+
+    def ldr_x_sp(self, rt, offset):
+        """LDR Xrt, [SP, #offset]"""
+        assert offset % 8 == 0 and 0 <= offset < 32768
+        self._emit(0xf94003e0 | ((offset // 8) << 10) | rt)
+
+    def stp_x_sp(self, rt1, rt2, offset):
+        """STP Xrt1, Xrt2, [SP, #offset]  (signed offset, 8-byte scaled)"""
+        assert offset % 8 == 0 and -512 <= offset < 512
+        imm7 = (offset // 8) & 0x7f
+        self._emit(0xa9000000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1)
+
+    def ldp_x_sp(self, rt1, rt2, offset):
+        """LDP Xrt1, Xrt2, [SP, #offset]"""
+        assert offset % 8 == 0 and -512 <= offset < 512
+        imm7 = (offset // 8) & 0x7f
+        self._emit(0xa9400000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1)
 
     # -- Branches --
 
     def b(self, target_label):
         self._patches.append((self.pos(), 'b', target_label))
-        self._emit(0x14000000)  # placeholder
+        self._emit(0x14000000)
 
     def b_cond(self, cond, target_label):
         self._patches.append((self.pos(), 'bcond', target_label))
-        self._emit(0x54000000 | cond)  # placeholder
+        self._emit(0x54000000 | cond)
 
     def b_back(self, target_label):
-        """Unconditional backward branch to an already-defined label."""
         target_pos = self._labels[target_label]
         disp = (target_pos - self.pos()) >> 2
         self._emit(0x14000000 | (disp & 0x03ffffff))
 
-    def b_cond_back(self, cond, target_label):
-        """Conditional backward branch to an already-defined label."""
-        target_pos = self._labels[target_label]
-        disp = (target_pos - self.pos()) >> 2
-        self._emit(0x54000000 | ((disp & 0x7ffff) << 5) | cond)
-
-    # -- Move between registers --
-
-    def mov_reg(self, rd, rm):
-        # ORR rd, wzr, rm
-        self._emit(0x2a000000 | (rm << 16) | (31 << 5) | rd)
+    def bl(self, target_func_name):
+        """Function call. Displacement filled in by the linker."""
+        self.calls.append((self.pos(), target_func_name))
+        self._emit(0x94000000)
 
     # -- Return --
 

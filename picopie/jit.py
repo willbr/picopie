@@ -1,4 +1,4 @@
-"""JIT execution: allocate executable memory, write code, call it."""
+"""JIT execution: allocate executable memory, write code, call functions in it."""
 
 import ctypes
 import ctypes.util
@@ -23,18 +23,21 @@ invalidate = libc.sys_icache_invalidate
 invalidate.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 
 
-def jit_call(code_bytes, args, ret_type=ctypes.c_int):
-    """Allocate executable memory, write code_bytes, call with args, return result."""
+def jit_load(code_bytes):
+    """Allocate executable memory, copy code in, mark executable. Returns buffer pointer."""
     size = len(code_bytes)
     buf = mmap(0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
     if buf == (1 << 64) - 1:
         raise RuntimeError("mmap failed")
-
     ctypes.memmove(buf, code_bytes, size)
     mprotect(buf, size, PROT_READ | PROT_EXEC)
     invalidate(buf, size)
+    return buf
 
-    arg_types = [ctypes.c_int] * len(args)
+
+def jit_call(buf, offset, args, ret_type=ctypes.c_int64):
+    """Call the function at buf+offset with int64 args."""
+    arg_types = [ctypes.c_int64] * len(args)
     functype = ctypes.CFUNCTYPE(ret_type, *arg_types)
-    func = functype(buf)
+    func = functype(buf + offset)
     return func(*args)
