@@ -20,6 +20,16 @@
 #include <ctype.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#include <errno.h>
+#include <limits.h>
+
+// Known limitations (by design, not bugs):
+//  - strings are NUL-terminated C strings, so an embedded '\0' (from "\0")
+//    truncates the value. supporting embedded NULs needs length-carrying
+//    strings, which this interpreter intentionally does not have.
+//  - values own heap strings that are never reclaimed until process exit, so
+//    a long-running loop or REPL session that builds many strings grows in
+//    memory. fine for the short scripts nanopie targets.
 
 /* ---------- helpers ---------- */
 
@@ -30,6 +40,14 @@ static char *sclone_n(const char*s, size_t n){ char*c=xmalloc(n+1); memcpy(c,s,n
 
 static jmp_buf g_jmp;
 static int g_can_longjmp = 0;
+
+/* recursion guards: bound C-stack use so crafted input fails gracefully
+   instead of overflowing the stack. counters are reset after a longjmp,
+   since the unwind skips the matching decrements. */
+#define MAX_PARSE_DEPTH 200    /* nested expressions / blocks */
+#define MAX_CALL_DEPTH  1000   /* user function call frames (mirrors python) */
+static int g_parse_depth = 0;
+static int g_call_depth = 0;
 
 static void die(const char*fmt, ...){
     va_list ap; va_start(ap,fmt);
@@ -69,7 +87,7 @@ static Value v_str(char*s){ Value v; v.type=V_STR; v.i=0; v.s=s; return v; }
 static Value v_none(void){ Value v; v.type=V_NONE; v.i=0; v.s=NULL; return v; }
 
 static char *val_to_str(Value v){
-    if(v.type==V_INT){ char buf[32]; sprintf(buf,"%ld",v.i); return sclone(buf); }
+    if(v.type==V_INT){ char buf[32]; snprintf(buf,sizeof buf,"%ld",v.i); return sclone(buf); }
     if(v.type==V_STR) return sclone(v.s?v.s:"");
     return sclone("None");
 }
@@ -141,11 +159,12 @@ static char peek2(Lexer*L){ return L->pos+1 < L->len ? L->src[L->pos+1] : 0; }
 static char peek3(Lexer*L){ return L->pos+2 < L->len ? L->src[L->pos+2] : 0; }
 static void adv(Lexer*L){ if(L->pos < L->len) L->pos++; }
 
-static void q_push(Lexer*L, int kind, const char*text, const char*sval, long ival){
+/* takes ownership of text/sval (may be NULL); they are freed at process exit */
+static void q_push(Lexer*L, int kind, char*text, char*sval, long ival){
     if(L->qhead >= L->qcount){ L->qhead=0; L->qcount=0; } /* compact when drained */
     if(L->qcount >= L->qcap){ L->qcap = L->qcap? L->qcap*2 : 16; L->queue=xrealloc(L->queue, L->qcap*sizeof(Token)); }
     Token *t = &L->queue[L->qcount++];
-    t->kind=kind; t->text=text?sclone(text):NULL; t->sval=sval?sclone(sval):NULL; t->ival=ival;
+    t->kind=kind; t->text=text; t->sval=sval; t->ival=ival;
 }
 
 static size_t count_indent(Lexer*L){
@@ -174,7 +193,10 @@ static Token read_token(Lexer*L){
         size_t start=L->pos;
         while(isdigit((unsigned char)peek(L))) adv(L);
         char *tmp=sclone_n(L->src+start, L->pos-start);
-        t.kind=TK_NUMBER; t.ival=atol(tmp); free(tmp); return t;
+        errno=0; char *end; long v=strtol(tmp,&end,10);
+        if(errno==ERANGE) die("integer literal too large");
+        free(tmp);
+        t.kind=TK_NUMBER; t.ival=v; return t;
     }
     if(c=='\''||c=='"') return read_string(L,0);
     /* operators, longest first */
@@ -245,15 +267,17 @@ static Token lex_next_token(Lexer*L){
                     q_push(L,TK_EOF,NULL,NULL,0);
                     break;
                 }
-                if(col > L->indents[L->nind-1]){
+                if(col > (size_t)L->indents[L->nind-1]){
+                    if(L->nind >= (int)(sizeof L->indents/sizeof L->indents[0]))
+                        die("too many indentation levels");
                     L->indents[L->nind++] = (int)col;
                     q_push(L,TK_INDENT,NULL,NULL,0);
-                } else if(col < L->indents[L->nind-1]){
-                    while(L->nind>1 && col < L->indents[L->nind-1]){
+                } else if(col < (size_t)L->indents[L->nind-1]){
+                    while(L->nind>1 && col < (size_t)L->indents[L->nind-1]){
                         L->nind--;
                         q_push(L,TK_DEDENT,NULL,NULL,0);
                     }
-                    if(col != L->indents[L->nind-1]) die("indentation error");
+                    if(col != (size_t)L->indents[L->nind-1]) die("indentation error");
                 }
                 L->at_line_start = 0;
                 L->line_has_content = 0;
@@ -344,7 +368,7 @@ static Node *parse_fstring(const char *content){
             size_t rl=strlen(raw);
             if(rl>0 && raw[rl-1]=='='){
                 char prev = (rl>=2)? raw[rl-2] : 0;
-                if(prev!='=' && prev!='!' && prev!='<' && prev!='>' && prev!=':' && prev!='='){
+                if(prev!='=' && prev!='!' && prev!='<' && prev!='>' && prev!=':'){
                     debug=1; prefix=sclone(raw);          /* e.g. "i=" or " i = " */
                     parse_src = sclone_n(raw, rl-1);
                     strip(parse_src);
@@ -433,7 +457,14 @@ static Node *parse_cmp(Lexer*L){
     return l;
 }
 
-static Node *parse_expr(Lexer*L){ return parse_cmp(L); }
+static Node *parse_expr(Lexer*L){
+    /* every nested sub-expression (parens, call args, f-string fields)
+       re-enters here, so this bounds expression nesting depth. */
+    if(++g_parse_depth > MAX_PARSE_DEPTH){ g_parse_depth--; die("expression too deeply nested"); }
+    Node *r = parse_cmp(L);
+    g_parse_depth--;
+    return r;
+}
 
 static Node *parse_block(Lexer*L);
 
@@ -550,6 +581,7 @@ static Node *parse_stmt(Lexer*L){
 }
 
 static Node *parse_block(Lexer*L){
+    if(++g_parse_depth > MAX_PARSE_DEPTH){ g_parse_depth--; die("block too deeply nested"); }
     Node *blk = new_node(N_BLOCK);
     if(is_op(L,":")||L->cur.kind==TK_NEWLINE){
         /* shouldn't hit ':' here; expect NEWLINE then INDENT */
@@ -563,10 +595,12 @@ static Node *parse_block(Lexer*L){
             node_push(blk, parse_stmt(L));
         }
         expect_kind(L,TK_DEDENT,"dedent");
+        g_parse_depth--;
         return blk;
     }
     /* inline single simple statement */
     node_push(blk, parse_simple_stmts(L));
+    g_parse_depth--;
     return blk;
 }
 
@@ -697,6 +731,7 @@ static void load_module(const char *mod, Env *env);
 
 static long py_floordiv(long a, long b){
     if(b==0) die("integer division by zero");
+    if(a==LONG_MIN && b==-1) die("integer overflow");
     long q = a / b;
     if((a % b != 0) && ((a<0) != (b<0))) q--;
     return q;
@@ -714,6 +749,7 @@ static long eval_int(Node *n, Env *e){
 
 static Value call_user_func(Func *f, Value *args, int nargs){
     if(nargs != f->nparams) die("'%s' expects %d args, got %d", f->name, f->nparams, nargs);
+    if(++g_call_depth > MAX_CALL_DEPTH){ g_call_depth--; die("maximum recursion depth exceeded"); }
     Env local; local.head = NULL;
     for(int i=0;i<nargs;i++) env_set(&local, f->params[i], args[i]);
     int saved_ret = g_returning; Value saved_val = g_retval;
@@ -721,6 +757,7 @@ static Value call_user_func(Func *f, Value *args, int nargs){
     eval_block(f->body, &local);
     Value r = g_returning ? g_retval : v_none();
     g_returning = saved_ret; g_retval = saved_val;
+    g_call_depth--;
     return r;
 }
 
@@ -730,6 +767,7 @@ static void print_args(Node **args, int n, Env *e){
         Value v = eval(args[i], e);
         char *s = val_to_str(v);
         fputs(s, stdout);
+        free(s);
     }
     fputc(10, stdout);
 }
@@ -761,9 +799,10 @@ static Value eval(Node *n, Env *e){
     }
     case N_BINOP: {
         long l = eval_int(n->a, e), r = eval_int(n->b, e);
-        if(!strcmp(n->op,"+")) return v_int(l + r);
-        if(!strcmp(n->op,"-")) return v_int(l - r);
-        if(!strcmp(n->op,"*")) return v_int(l * r);
+        long res;
+        if(!strcmp(n->op,"+")){ if(__builtin_add_overflow(l,r,&res)) die("integer overflow"); return v_int(res); }
+        if(!strcmp(n->op,"-")){ if(__builtin_sub_overflow(l,r,&res)) die("integer overflow"); return v_int(res); }
+        if(!strcmp(n->op,"*")){ if(__builtin_mul_overflow(l,r,&res)) die("integer overflow"); return v_int(res); }
         if(!strcmp(n->op,"//")) return v_int(py_floordiv(l,r));
         if(!strcmp(n->op,"%")) return v_int(py_mod(l,r));
         if(!strcmp(n->op,"/")) return v_int(py_floordiv(l,r)); /* no floats; floor */
@@ -898,15 +937,22 @@ static char *module_to_path(const char *mod){
     for(char*q=p; *q; q++) if(*q=='.') *q='/';
     size_t n = strlen(p);
     char *path = xmalloc(n + 4);
-    sprintf(path, "%s.py", p);
+    snprintf(path, n + 4, "%s.py", p);
     free(p);
     return path;
 }
 
+/* modules already imported this run; mirrors python's import cache and, by
+   marking a module loaded before running it, breaks circular-import cycles. */
+static char *g_loaded_mods[256];
+static int g_nloaded = 0;
+
 static void load_module(const char *mod, Env *env){
+    for(int i=0;i<g_nloaded;i++) if(strcmp(g_loaded_mods[i],mod)==0) return;
+    if(g_nloaded < 256) g_loaded_mods[g_nloaded++] = sclone(mod);
     char *path = module_to_path(mod);
     char *code = read_file(path);
-    if(!code){ die("cannot open module '%s' (%s)", mod, path); free(path); return; }
+    if(!code) die("cannot open module '%s' (%s)", mod, path);
     free(path);
     run_source(code, env, 0);
 }
@@ -965,6 +1011,7 @@ static void repl_echo(Env *env, Node *expr){
         char *s = val_to_str(v);
         fputs(s, stdout);
         fputc(10, stdout);
+        free(s);
     }
 }
 
@@ -991,33 +1038,50 @@ static void run_source(const char *code, Env *env, int repl){
 
 /* ---------- repl ---------- */
 
+/* read one full line from stdin as a fresh string (newline stripped), or NULL
+   at EOF with no data. handles arbitrarily long lines, unlike a fixed buffer. */
+static char *read_line_dyn(void){
+    SB sb; sb_init(&sb);
+    int c, any=0;
+    while((c=fgetc(stdin))!=EOF){
+        any=1;
+        if(c=='\n') break;
+        sb_appendc(&sb, (char)c);
+    }
+    if(!any){ free(sb.data); return NULL; }
+    while(sb.len>0 && sb.data[sb.len-1]=='\r') sb.data[--sb.len]=0;
+    char *r = sb_str(&sb); free(sb.data); return r;
+}
+
 static char *read_repl_input(void){
-    char line[4096];
     fputs(">>> ", stdout); fflush(stdout);
-    if(!fgets(line, sizeof line, stdin)) return NULL;
+    char *line = read_line_dyn();
+    if(!line) return NULL;
     size_t len = strlen(line);
-    while(len>0 && (line[len-1]=='\n'||line[len-1]=='\r')) line[--len]=0;
-    if(line[0]==0) return sclone("");
-    if(len>0 && line[len-1]==':'){
+    if(len==0) return line;  /* already a fresh empty string */
+    if(line[len-1]==':'){
         SB sb; sb_init(&sb);
         sb_append(&sb, line); sb_appendc(&sb, '\n');
+        free(line);
         for(;;){
             fputs("... ", stdout); fflush(stdout);
-            if(!fgets(line, sizeof line, stdin)) break;
-            len = strlen(line);
-            while(len>0 && (line[len-1]=='\n'||line[len-1]=='\r')) line[--len]=0;
-            if(line[0]==0) break;  /* blank line ends block */
+            line = read_line_dyn();
+            if(!line) break;
+            if(line[0]==0){ free(line); break; }  /* blank line ends block */
             sb_append(&sb, line); sb_appendc(&sb, '\n');
+            free(line);
         }
-        return sb_str(&sb);
+        char *r = sb_str(&sb); free(sb.data); return r;
     }
-    return sclone(line);
+    return line;
 }
 
 static void repl(Env *env){
     g_can_longjmp = 1;
     for(;;){
-        if(setjmp(g_jmp) != 0){ continue; }
+        /* a longjmp out of die() skips the matching depth decrements, so
+           clear the guards before prompting for the next statement. */
+        if(setjmp(g_jmp) != 0){ g_parse_depth=0; g_call_depth=0; g_returning=0; continue; }
         char *input = read_repl_input();
         if(input==NULL){ fputc(10, stdout); break; }
         if(input[0]==0){ free(input); continue; }
