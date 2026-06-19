@@ -1,18 +1,84 @@
-// nanopie - a tiny python interpreter
+// nanopie - a tiny python interpreter as a single-header library.
 // fast startup, simple programs only. tree-walking evaluator.
-// supports: ints, strings, f-strings ({x} and {x=}), variables,
-// def/return, if/elif/else, while, for-in-range, + - * / // %,
-// comparisons, print(), and `import dotted.name` to load .py files.
 //
-// build: cc -O2 -Wall -o nanopie nanopie.c
-// run:   ./nanopie                        # repl
-//        ./nanopie examples/fib.py        # run file, exit
-//        ./nanopie -i examples/fib.py     # run file then repl (like python -i)
-//        ./nanopie -c 'print(1+2)'        # run a command string
-//        ./nanopie -m examples.fib        # run a module by dotted name
-//        ./nanopie -                      # read program from stdin
-//        ./nanopie --print-ast examples/fib.py           # dump AST as s-exprs
-//        ./nanopie --print-ast-and-imports examples/fib.py  # also dump imports
+// the lexer, parser, and evaluator are reusable. include this header anywhere
+// for the declarations; in exactly ONE translation unit do
+//
+//     #define NANOPIE_IMPLEMENTATION
+//     #include "nanopie.h"
+//
+// to also pull in the implementation. nanopie/main.c is the CLI built this way.
+//
+// quick start:
+//     Env env; env_init(&env);
+//     run_source("print(1 + 2)\n", &env, 0);    // parse + run a program
+//     Node *e = parse_expr_str("2 * (3 + 4)");  // or parse one expression...
+//     Value v = eval(e, &env);                  // ...and evaluate it (-> 14)
+//
+// supports: ints, strings, f-strings ({x} and {x=}), variables, def/return,
+// if/elif/else, while, for-in-range, + - * / // %, comparisons, print(), and
+// `import dotted.name` to load .py files.
+//
+// Known limitations (by design, not bugs):
+//  - strings are NUL-terminated C strings, so an embedded '\0' (from "\0")
+//    truncates the value. supporting embedded NULs needs length-carrying
+//    strings, which this interpreter intentionally does not have.
+//  - values own heap strings that are never reclaimed until process exit, so
+//    a long-running loop or REPL session that builds many strings grows in
+//    memory. fine for the short scripts nanopie targets.
+
+#ifndef NANOPIE_H
+#define NANOPIE_H
+
+#include <stddef.h>   /* size_t */
+#include <setjmp.h>   /* jmp_buf, for optional error recovery */
+
+/* ---------- values ---------- */
+enum { V_INT, V_STR, V_NONE };
+typedef struct { int type; long i; char *s; } Value;
+Value v_int(long i);
+Value v_str(char *s);
+Value v_none(void);
+char *val_to_str(Value v);   /* heap string ("None"/int/str); caller frees */
+
+/* ---------- environment (variable bindings) ---------- */
+typedef struct Binding Binding;          /* opaque */
+typedef struct { Binding *head; } Env;
+void env_init(Env *e);                    /* start an empty environment */
+void env_set(Env *e, const char *name, Value v);
+
+/* ---------- ast ---------- */
+typedef struct Node Node;                 /* opaque */
+Node *parse_source(const char *code);     /* parse a program into a block node */
+Node *parse_expr_str(const char *s);      /* parse a single bare expression */
+void  print_program(Node *blk);           /* dump AST as s-expressions */
+
+/* ---------- evaluation ---------- */
+Value eval(Node *n, Env *e);              /* evaluate one expression node */
+void  run_source(const char *code, Env *env, int repl);  /* parse + execute */
+
+/* ---------- modules & io ---------- */
+char *read_file(const char *path);        /* whole file as a heap string, or NULL */
+char *read_stdin_all(void);               /* all of stdin as a heap string */
+char *module_to_path(const char *mod);    /* "a.b" -> "a/b.py" (heap) */
+void  load_module(const char *mod, Env *env);  /* import once, runs the module */
+void  print_ast_and_imports(const char *code, const char *origin, const char *self_path);
+
+/* ---------- interactive ---------- */
+void repl(Env *env);                      /* read-eval-print loop on stdin */
+
+/* ---------- utilities ---------- */
+char *sclone(const char *s);              /* strdup, NULL-safe, aborts on oom */
+void  die(const char *fmt, ...);          /* report an error; longjmp or exit(1) */
+
+/* optional error recovery: a host may setjmp(g_jmp) and set g_can_longjmp,
+   after which die() longjmps back instead of calling exit(1). */
+extern jmp_buf g_jmp;
+extern int     g_can_longjmp;
+
+#endif /* NANOPIE_H */
+
+#ifdef NANOPIE_IMPLEMENTATION
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,23 +89,15 @@
 #include <errno.h>
 #include <limits.h>
 
-// Known limitations (by design, not bugs):
-//  - strings are NUL-terminated C strings, so an embedded '\0' (from "\0")
-//    truncates the value. supporting embedded NULs needs length-carrying
-//    strings, which this interpreter intentionally does not have.
-//  - values own heap strings that are never reclaimed until process exit, so
-//    a long-running loop or REPL session that builds many strings grows in
-//    memory. fine for the short scripts nanopie targets.
-
 /* ---------- helpers ---------- */
 
 static void *xmalloc(size_t n){ void*p=malloc(n); if(!p){ fprintf(stderr,"oom"); fputc(10,stderr); exit(1); } return p; }
 static void *xrealloc(void*p,size_t n){ void*q=realloc(p,n); if(!q){ fprintf(stderr,"oom"); fputc(10,stderr); exit(1); } return q; }
-static char *sclone(const char*s){ if(!s) return NULL; size_t n=strlen(s)+1; char*c=xmalloc(n); memcpy(c,s,n); return c; }
+char *sclone(const char*s){ if(!s) return NULL; size_t n=strlen(s)+1; char*c=xmalloc(n); memcpy(c,s,n); return c; }
 static char *sclone_n(const char*s, size_t n){ char*c=xmalloc(n+1); memcpy(c,s,n); c[n]=0; return c; }
 
-static jmp_buf g_jmp;
-static int g_can_longjmp = 0;
+jmp_buf g_jmp;
+int g_can_longjmp = 0;
 
 /* recursion guards: bound C-stack use so crafted input fails gracefully
    instead of overflowing the stack. counters are reset after a longjmp,
@@ -49,7 +107,7 @@ static int g_can_longjmp = 0;
 static int g_parse_depth = 0;
 static int g_call_depth = 0;
 
-static void die(const char*fmt, ...){
+void die(const char*fmt, ...){
     va_list ap; va_start(ap,fmt);
     fprintf(stderr,"nanopie: ");
     vfprintf(stderr,fmt,ap);
@@ -79,14 +137,11 @@ static void strip(char*s){ char*p=s; while(*p==' '||*p=='\t') p++; if(p!=s) memm
 
 /* ---------- values ---------- */
 
-enum { V_INT, V_STR, V_NONE };
-typedef struct { int type; long i; char *s; } Value;
+Value v_int(long i){ Value v; v.type=V_INT; v.i=i; v.s=NULL; return v; }
+Value v_str(char*s){ Value v; v.type=V_STR; v.i=0; v.s=s; return v; }
+Value v_none(void){ Value v; v.type=V_NONE; v.i=0; v.s=NULL; return v; }
 
-static Value v_int(long i){ Value v; v.type=V_INT; v.i=i; v.s=NULL; return v; }
-static Value v_str(char*s){ Value v; v.type=V_STR; v.i=0; v.s=s; return v; }
-static Value v_none(void){ Value v; v.type=V_NONE; v.i=0; v.s=NULL; return v; }
-
-static char *val_to_str(Value v){
+char *val_to_str(Value v){
     if(v.type==V_INT){ char buf[32]; snprintf(buf,sizeof buf,"%ld",v.i); return sclone(buf); }
     if(v.type==V_STR) return sclone(v.s?v.s:"");
     return sclone("None");
@@ -100,16 +155,15 @@ static int truthy(Value v){
 
 /* ---------- environment ---------- */
 
-typedef struct Binding { char *name; Value val; struct Binding *next; } Binding;
-typedef struct { Binding *head; } Env;
+struct Binding { char *name; Value val; struct Binding *next; };
 
+void env_init(Env*e){ e->head=NULL; }
 static Binding* env_find(Env*e,const char*n){ for(Binding*b=e->head;b;b=b->next) if(strcmp(b->name,n)==0) return b; return NULL; }
-static void env_set(Env*e,const char*n,Value v){ Binding*b=env_find(e,n); if(b){b->val=v;} else { b=xmalloc(sizeof *b); b->name=sclone(n); b->val=v; b->next=e->head; e->head=b; } }
+void env_set(Env*e,const char*n,Value v){ Binding*b=env_find(e,n); if(b){b->val=v;} else { b=xmalloc(sizeof *b); b->name=sclone(n); b->val=v; b->next=e->head; e->head=b; } }
 static Value env_get(Env*e,const char*n){ Binding*b=env_find(e,n); if(!b) die("name '%s' is not defined", n); return b->val; }
 
 /* ---------- ast ---------- */
 
-typedef struct Node Node;
 struct Node {
     int type;
     long ival;
@@ -348,6 +402,10 @@ static Node *parse_subexpr(const char *s){
     if(sub.cur.kind != TK_EOF) die("trailing tokens in fstring expression");
     return e;
 }
+
+/* public: parse a single bare expression (for callers that want to eval() it
+   directly, since parse_source() returns a statement block). */
+Node *parse_expr_str(const char *s){ return parse_subexpr(s); }
 
 static Node *parse_fstring(const char *content){
     Node *node = new_node(N_FSTR);
@@ -605,7 +663,7 @@ static Node *parse_block(Lexer*L){
 }
 
 /* parse an entire source string into a block of top-level statements */
-static Node *parse_source(const char *code){
+Node *parse_source(const char *code){
     Lexer L; lex_init(&L, code, 0); lex_advance(&L);
     Node *blk = new_node(N_BLOCK);
     while(L.cur.kind != TK_EOF){
@@ -712,7 +770,7 @@ static void print_ast(Node *n, int ind){
     }
 }
 
-static void print_program(Node *blk){
+void print_program(Node *blk){
     for(int i=0;i<blk->nlist;i++){
         if(i>0) fputc('\n', stdout);
         print_ast(blk->list[i], 0);
@@ -726,8 +784,8 @@ static int g_returning = 0;
 static Value g_retval;
 
 static int eval_block(Node *blk, Env *e);
-static Value eval(Node *n, Env *e);
-static void load_module(const char *mod, Env *env);
+Value eval(Node *n, Env *e);
+void load_module(const char *mod, Env *env);
 
 static long py_floordiv(long a, long b){
     if(b==0) die("integer division by zero");
@@ -772,7 +830,7 @@ static void print_args(Node **args, int n, Env *e){
     fputc(10, stdout);
 }
 
-static Value eval(Node *n, Env *e){
+Value eval(Node *n, Env *e){
     switch(n->type){
     case N_NUM: return v_int(n->ival);
     case N_STR: return v_str(sclone(n->sval));
@@ -916,7 +974,7 @@ static int eval_block(Node *blk, Env *e){
 
 /* ---------- file loading ---------- */
 
-static char *read_file(const char *path){
+char *read_file(const char *path){
     FILE *f = fopen(path, "rb");
     if(!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -930,9 +988,9 @@ static char *read_file(const char *path){
     return buf;
 }
 
-static void run_source(const char *code, Env *env, int repl);
+void run_source(const char *code, Env *env, int repl);
 
-static char *module_to_path(const char *mod){
+char *module_to_path(const char *mod){
     char *p = sclone(mod);
     for(char*q=p; *q; q++) if(*q=='.') *q='/';
     size_t n = strlen(p);
@@ -947,7 +1005,7 @@ static char *module_to_path(const char *mod){
 static char *g_loaded_mods[256];
 static int g_nloaded = 0;
 
-static void load_module(const char *mod, Env *env){
+void load_module(const char *mod, Env *env){
     for(int i=0;i<g_nloaded;i++) if(strcmp(g_loaded_mods[i],mod)==0) return;
     if(g_nloaded < 256) g_loaded_mods[g_nloaded++] = sclone(mod);
     char *path = module_to_path(mod);
@@ -981,7 +1039,7 @@ static void collect_imports(Node *n){
     for(int i=0;i<n->nlist;i++) collect_imports(n->list[i]);
 }
 
-static void print_ast_and_imports(const char *code, const char *origin, const char *self_path){
+void print_ast_and_imports(const char *code, const char *origin, const char *self_path){
     if(self_path && !already_visited(self_path) && g_nvisited < 256)
         g_visited_paths[g_nvisited++] = sclone(self_path);
     Node *blk = parse_source(code);
@@ -1015,7 +1073,7 @@ static void repl_echo(Env *env, Node *expr){
     }
 }
 
-static void run_source(const char *code, Env *env, int repl){
+void run_source(const char *code, Env *env, int repl){
     Lexer L; lex_init(&L, code, 0); lex_advance(&L);
     while(L.cur.kind != TK_EOF){
         if(L.cur.kind==TK_NEWLINE){ lex_advance(&L); continue; }
@@ -1076,7 +1134,7 @@ static char *read_repl_input(void){
     return line;
 }
 
-static void repl(Env *env){
+void repl(Env *env){
     g_can_longjmp = 1;
     for(;;){
         /* a longjmp out of die() skips the matching depth decrements, so
@@ -1090,30 +1148,9 @@ static void repl(Env *env){
     }
 }
 
-/* ---------- main ---------- */
+/* ---------- stdin ---------- */
 
-static void print_version(void){ fputs("nanopie 0.1\n", stdout); }
-
-static void print_help(void){
-    fputs(
-"usage: nanopie [option ...] [file]\n"
-"\n"
-"options:\n"
-"  -c <cmd>    execute the program passed as a string\n"
-"  -m <mod>    run a module by dotted name (e.g. examples.fib)\n"
-"  -i          run then drop into the interactive REPL (like python -i)\n"
-"  -           read the program from stdin\n"
-"  --print-ast              parse, dump the AST as s-expressions, and exit\n"
-"  --print-ast-and-imports  like --print-ast, also dump imported modules\n"
-"  -V          print version and exit\n"
-"  -h, --help  print this help and exit\n"
-"  --          stop processing options; next arg is the file\n"
-"\n"
-"no arguments  start the REPL\n",
-    stdout);
-}
-
-static char *read_stdin_all(void){
+char *read_stdin_all(void){
     SB sb; sb_init(&sb);
     char buf[4096];
     size_t n;
@@ -1121,88 +1158,4 @@ static char *read_stdin_all(void){
     return sb_str(&sb);
 }
 
-int main(int argc, char **argv){
-    Env global; global.head = NULL;
-    env_set(&global, "True", v_int(1));
-    env_set(&global, "False", v_int(0));
-    env_set(&global, "None", v_none());
-
-    int force_interactive = 0;
-    int dump_ast = 0;          /* 0=no, 1=--print-ast, 2=--print-ast-and-imports */
-    const char *cmd = NULL;     /* -c */
-    const char *mod = NULL;     /* -m */
-    int read_std = 0;           /* -  */
-    const char *file = NULL;    /* positional */
-    int have_source = 0;        /* one of cmd/mod/stdin/file given */
-
-    for(int i=1; i<argc; i++){
-        if(!strcmp(argv[i], "-i")){ force_interactive = 1; continue; }
-        if(!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")){ print_help(); return 0; }
-        if(!strcmp(argv[i], "-V") || !strcmp(argv[i], "--version")){ print_version(); return 0; }
-        if(!strcmp(argv[i], "--print-ast")){ dump_ast = 1; continue; }
-        if(!strcmp(argv[i], "--print-ast-and-imports")){ dump_ast = 2; continue; }
-        if(!strcmp(argv[i], "-c")){
-            if(++i >= argc) die("argument expected for -c");
-            if(have_source) die("only one of -c/-m/-/file allowed");
-            cmd = argv[i]; have_source = 1; continue;
-        }
-        if(!strcmp(argv[i], "-m")){
-            if(++i >= argc) die("argument expected for -m");
-            if(have_source) die("only one of -c/-m/-/file allowed");
-            mod = argv[i]; have_source = 1; continue;
-        }
-        if(!strcmp(argv[i], "-")){
-            if(have_source) die("only one of -c/-m/-/file allowed");
-            read_std = 1; have_source = 1; continue;
-        }
-        if(!strcmp(argv[i], "--")){
-            if(++i < argc){
-                if(have_source) die("only one of -c/-m/-/file allowed");
-                file = argv[i]; have_source = 1;
-            }
-            continue;
-        }
-        if(argv[i][0]=='-' && argv[i][1] != '\0') die("unknown option '%s'", argv[i]);
-        if(have_source) die("only one of -c/-m/-/file allowed");
-        file = argv[i]; have_source = 1;
-    }
-
-    if(dump_ast && !have_source) die("--print-ast requires a source (-c, -m, -, or file)");
-
-    /* resolve the source string and an origin label for module headers */
-    const char *source = NULL;
-    char *source_alloc = NULL;
-    const char *origin = NULL;
-    if(cmd){ source = cmd; origin = "<command>"; }
-    else if(mod){
-        char *path = module_to_path(mod);
-        source_alloc = read_file(path);
-        if(!source_alloc){ fprintf(stderr,"nanopie: cannot open module '%s' (%s)\n", mod, path); free(path); return 1; }
-        free(path);
-        source = source_alloc; origin = mod;
-    } else if(read_std){
-        source_alloc = read_stdin_all();
-        source = source_alloc; origin = "<stdin>";
-    } else if(file){
-        source_alloc = read_file(file);
-        if(!source_alloc){ fprintf(stderr,"nanopie: cannot open '%s'\n", file); return 1; }
-        source = source_alloc; origin = file;
-    }
-
-    if(dump_ast == 1){
-        Node *blk = parse_source(source);
-        print_program(blk);
-    } else if(dump_ast == 2){
-        char *self = NULL;
-        if(mod) self = module_to_path(mod);   /* -m: root can be re-imported */
-        else if(file) self = sclone(file);    /* file: root can be re-imported */
-        print_ast_and_imports(source, origin, self);
-        free(self);
-    } else if(source){
-        run_source(source, &global, 0);
-    }
-    free(source_alloc);
-
-    if(!dump_ast && (force_interactive || !have_source)) repl(&global);
-    return 0;
-}
+#endif /* NANOPIE_IMPLEMENTATION */

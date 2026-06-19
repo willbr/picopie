@@ -26,8 +26,8 @@ test-d:
 .PHONY: nanopie
 nanopie: nanopie/nanopie
 
-nanopie/nanopie: nanopie/nanopie.c
-	cc -O2 -Wall -Wextra -o nanopie/nanopie nanopie/nanopie.c
+nanopie/nanopie: nanopie/main.c nanopie/nanopie.h
+	cc -O2 -Wall -Wextra -o nanopie/nanopie nanopie/main.c
 
 repl: nanopie
 	./nanopie/nanopie -i
