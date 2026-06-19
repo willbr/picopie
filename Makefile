@@ -23,6 +23,15 @@ test-d:
 	$(PYTHON) -m picopie -d examples/fact.py 5
 	$(PYTHON) -m picopie -d examples/call.py 5
 
+.PHONY: nanopie
+nanopie: nanopie/nanopie
+
+nanopie/nanopie: nanopie/nanopie.c
+	cc -O2 -Wall -Wextra -o nanopie/nanopie nanopie/nanopie.c
+
+repl: nanopie
+	./nanopie/nanopie -i
+
 wall:
 	watchexec -cr "make all"
 

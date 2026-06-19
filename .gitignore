@@ -170,3 +170,6 @@ cython_debug/
 aarch64/test/hello
 *.o
 
+# nanopie build artifact
+nanopie/nanopie
+
